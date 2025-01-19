@@ -11,11 +11,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
     
-    def _norm(self, x):
-        return x * torch.rsqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-    
     def forward(self, x):
-        return self.weight * self._norm(x).type_as(x)
+        xrms = torch.sqrt(torch.pow(x, 2).mean(dim=-1) + self.eps).unsqueeze(-1) # (batch, seq len, 1)
+        return (x / xrms) * self.weight # (b, seq len, dim) * (dim)
 
 @dataclass
 class ModelArgs:
@@ -27,11 +25,9 @@ class ModelArgs:
     multiple_of: int = 256
     ff_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-    
     # KV cache settings
     max_batch_size: int = 32
     max_seq_len: int = 2048
-    
     device: str = None
 
 def precompute_theta_pos_freq(d_head : int, seq_len: int, device: str = None, theta: float = 10000.0):
@@ -45,21 +41,21 @@ def precompute_theta_pos_freq(d_head : int, seq_len: int, device: str = None, th
     
 def apply_rotary_embeddings(x : torch.Tensor, freqs_complex: torch.Tensor, device: str):
     batch_size, seq_len, n_heads, d_head = x.shape
-    x_grp = x.view(batch_size, seq_len, n_heads, -1, 2) # [b, seq len, d] => [b, seq len, d / 2, 2]
-    x_complex = torch.complex(x_grp[:, :, :, :, 0], x_grp[:, :, :, :, 1]).to(device) # [b, seq len, d / 2]
-    prod = x_complex * freqs_complex.unsqueeze(0) # [b, seq len, d / 2]
-    out = torch.view_as_real(prod) # [b, seq len, d / 2, 2]
-    out = out.reshape(*x.shape).type(torch.float16) # [b, seq len, d]
+    x_grp = x.view(batch_size, seq_len, n_heads, -1, 2) # [b, seq len, h, d] => [b, seq len, h, d / 2, 2]
+    x_complex = torch.complex(x_grp[:, :, :, :, 0], x_grp[:, :, :, :, 1]).to(device) # [b, seq len, h, d / 2]
+    prod = x_complex * freqs_complex.unsqueeze(0).unsqueeze(2) # [b, seq len, h, d / 2] * [1, seq len, 1, d / 2]
+    out = torch.view_as_real(prod) # [b, seq len, h, d / 2, 2]
+    out = out.reshape(*x.shape).type(torch.float16) # [b, seq len, h, d]
     return out
 
 class FeedForwardBlock(nn.Module):
     def __init__(self, args:ModelArgs):
         super().__init__()
         hidden_dim = 4 * args.dim
-        hidden_dim = hidden_dim * (2/ 3)
+        hidden_dim = int(2 * hidden_dim / 3)
         if args.ff_dim_multiplier is not None:
             hidden_dim = int(args.ff_dim_multiplier * hidden_dim)
-        hidden_dim = int(args.multiple_of * math.ceil(hidden_dim / args.multiple_of))
+        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
         self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
         self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
@@ -133,7 +129,7 @@ def repeat_kv(x, num_repeat):
             # [B, seq len, num kv heads, head dim]
             x[:, :, :, None, :]
             .expand(batch_size, seq_len, n_kv_heads, num_repeat, head_dim)
-            .reshape(x.shape[:2], -1, x.shape[-1])
+            .reshape(*x.shape[:2], -1, x.shape[-1])
             # [B, seq len, n_kv_heads * num_repeast, head_dim]
         )
 
