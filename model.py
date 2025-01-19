@@ -12,8 +12,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
     
     def forward(self, x):
-        xrms = torch.sqrt(torch.pow(x, 2).mean(dim=-1) + self.eps).unsqueeze(-1) # (batch, seq len, 1)
-        return (x / xrms) * self.weight # (b, seq len, dim) * (dim)
+        xrms = torch.sqrt(torch.pow(x.float(), 2).mean(dim=-1, keepdim=True) + self.eps) # (batch, seq len, 1)
+        return (x.float() / xrms).type_as(x) * self.weight # (b, seq len, dim) * (dim)
 
 @dataclass
 class ModelArgs:
@@ -25,7 +25,6 @@ class ModelArgs:
     multiple_of: int = 256
     ff_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
-    # KV cache settings
     max_batch_size: int = 32
     max_seq_len: int = 2048
     device: str = None
@@ -34,19 +33,19 @@ def precompute_theta_pos_freq(d_head : int, seq_len: int, device: str = None, th
     assert d_head % 2 == 0, "Head dim must be divisible by 2"
     theta_exp = torch.arange(0, d_head, 2).float()
     theta_val = 1 / (theta ** (theta_exp / d_head)).to(device) # [1, d / 2]
-    m = torch.arange(seq_len, device=device).float() # [1, m]
-    freq = torch.outer(m, theta_val) # [m, d / 2]
+    m = torch.arange(seq_len, device=device) # [1, m]
+    freq = torch.outer(m, theta_val).float() # [m, d / 2]
     freq_complex = torch.polar(torch.ones_like(freq), freq) # [m, d / 2]
     return freq_complex
     
 def apply_rotary_embeddings(x : torch.Tensor, freqs_complex: torch.Tensor, device: str):
     batch_size, seq_len, n_heads, d_head = x.shape
-    x_grp = x.view(batch_size, seq_len, n_heads, -1, 2) # [b, seq len, h, d] => [b, seq len, h, d / 2, 2]
-    x_complex = torch.complex(x_grp[:, :, :, :, 0], x_grp[:, :, :, :, 1]).to(device) # [b, seq len, h, d / 2]
+    x_grp = x.float().view(batch_size, seq_len, n_heads, -1, 2) # [b, seq len, h, d] => [b, seq len, h, d / 2, 2]
+    x_complex = torch.complex(x_grp[:, :, :, :, 0], x_grp[:, :, :, :, 1]) # [b, seq len, h, d / 2]
     prod = x_complex * freqs_complex.unsqueeze(0).unsqueeze(2) # [b, seq len, h, d / 2] * [1, seq len, 1, d / 2]
     out = torch.view_as_real(prod) # [b, seq len, h, d / 2, 2]
-    out = out.reshape(*x.shape).type(torch.float16) # [b, seq len, h, d]
-    return out
+    out = out.reshape(*x.shape) # [b, seq len, h, d]
+    return out.type_as(x).to(device)
 
 class FeedForwardBlock(nn.Module):
     def __init__(self, args:ModelArgs):
@@ -62,14 +61,13 @@ class FeedForwardBlock(nn.Module):
     
     def forward(self, x):
         swish = F.silu(self.w1(x))
-        x3 = self.w3(x)
-        x = swish * x3
+        x_V = self.w3(x)
+        x = swish * x_V
         return self.w2(x)
         
 class SelfAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.dim = args.dim
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_heads = args.n_heads
         self.head_dim = args.dim // args.n_heads
@@ -91,9 +89,9 @@ class SelfAttention(nn.Module):
         xk = self.wk(x) # (B, 1, num kv heads * head dim)
         xv = self.wv(x) # (B, 1, num kv heads * head dim)
         
-        xq = xq.view(x.shape[0], x.shape[1], self.n_heads, self.head_dim)
-        xk = xk.view(x.shape[0], x.shape[1], self.n_kv_heads, self.head_dim)
-        xv = xv.view(x.shape[0], x.shape[1], self.n_kv_heads, self.head_dim)
+        xq = xq.view(batch_size, seq_len, self.n_heads, self.head_dim)
+        xk = xk.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seq_len, self.n_kv_heads, self.head_dim)
         
         xq = apply_rotary_embeddings(xq, freq_complex, device=x.device)
         xk = apply_rotary_embeddings(xk, freq_complex, device=x.device)
@@ -106,7 +104,7 @@ class SelfAttention(nn.Module):
         values = self.cache_v[:batch_size, :start_pos+seq_len]
         
         keys = repeat_kv(keys, self.num_rep) # [batch size, seq len, num kv heads * num repeat, head_dim]
-        values = repeat_kv(keys, self.num_rep) # [batch size, seq len, num kv heads * num repeat, head_dim]
+        values = repeat_kv(values, self.num_rep) # [batch size, seq len, num kv heads * num repeat, head_dim]
 
         # remove head dim - each head will observe all sequence but only part of the embedding
         xq = xq.transpose(1, 2) # [batch size, n_heads, seq len, head_dim]
@@ -124,14 +122,12 @@ def repeat_kv(x, num_repeat):
     batch_size, seq_len, n_kv_heads, head_dim = x.shape
     if num_repeat == 1:
         return x
-    else:
-        return (
-            # [B, seq len, num kv heads, head dim]
-            x[:, :, :, None, :]
-            .expand(batch_size, seq_len, n_kv_heads, num_repeat, head_dim)
-            .reshape(*x.shape[:2], -1, x.shape[-1])
-            # [B, seq len, n_kv_heads * num_repeast, head_dim]
-        )
+    return (
+        # [B, seq len, num kv heads, head dim]
+        x[:, :, :, None, :]
+        .expand(batch_size, seq_len, n_kv_heads, num_repeat, head_dim)
+        .reshape(batch_size, seq_len, n_kv_heads * num_repeat, head_dim)
+    )
 
 class EncoderBlock(nn.Module):
     
