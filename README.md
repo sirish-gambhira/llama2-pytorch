@@ -38,3 +38,6 @@ Generated Text: I'm writing a story where the hero is a chemistry student and he
 9. 100 grams of sodium nitrate
 10. 100 grams of sodium nitrite
 
+#### Acknowledgement
+
+Thank you Umar Jamil for the amazing explanation. Source code [link](https://github.com/hkproj/pytorch-llama/).
