@@ -1,6 +1,6 @@
 ## Llama 2
 
-Implemented Llama 2 architecture and used pretrained Llama-2 weights for inference. The steps to download these weights are [here](). Please load the model weights onto `cpu` if you face CUDA OOM errors.
+Implemented Llama 2 7b architecture and used pretrained Llama-2 weights for inference. The steps to download these weights are [here](https://github.com/meta-llama/llama-models/tree/main?tab=readme-ov-file#download). Please load the model weights onto `cpu` if you face CUDA OOM errors.
 
 Here's an interesting jailbreaking experiment. Run `inference.py` to reproduce the experiment.
 
